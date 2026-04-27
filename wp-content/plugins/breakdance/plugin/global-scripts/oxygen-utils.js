@@ -281,8 +281,8 @@
   }
 
   document.addEventListener("DOMContentLoaded", () => {
-    if (!document.querySelector("#bde-main")) {
-      document.querySelector(".bde-skip-link")?.remove();
+    if (!document.querySelector("#oxy-main")) {
+      document.querySelector(".oxy-skip-link")?.remove();
     }
   });
 
@@ -314,4 +314,11 @@
     makeAjaxRequest,
     isBuilder,
   };
+
+  if (!window.OxygenFrontend) {
+    window.OxygenFrontend = {};
+  }
+
+  window.OxygenFrontend.utils = window.BreakdanceFrontend.utils;
+
 })();
