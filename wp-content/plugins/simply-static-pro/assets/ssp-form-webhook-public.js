@@ -841,6 +841,166 @@ if (!window.__sspTurnstileReady) {
         return headers;
     }
 
+    function queuedFileEntries(data) {
+        var files = [];
+        if (!(data instanceof FormData)) { return files; }
+        var position = 0;
+        data.forEach(function (value, fieldName) {
+            if (!(value instanceof File) || value.size < 1) { return; }
+            files.push({ position: position++, fieldName: String(fieldName), file: value });
+        });
+        return files;
+    }
+
+    function queueSubmissionData(data, attachmentIds) {
+        var clean = new FormData();
+        data.forEach(function (value, fieldName) {
+            if (!(value instanceof File)) { clean.append(fieldName, value); }
+        });
+        clean.set('_ssp_attachments', JSON.stringify(attachmentIds));
+        return clean;
+    }
+
+    function sha256File(file) {
+        if (!window.crypto || !window.crypto.subtle || typeof file.arrayBuffer !== 'function') {
+            return Promise.reject(new Error('This browser cannot verify attachment integrity.'));
+        }
+        return file.arrayBuffer().then(function (bytes) {
+            return window.crypto.subtle.digest('SHA-256', bytes);
+        }).then(function (digest) {
+            return Array.prototype.map.call(new Uint8Array(digest), function (value) {
+                return value.toString(16).padStart(2, '0');
+            }).join('');
+        });
+    }
+
+    function resolveAttachmentEndpoint(settings, submitUrl) {
+        var configured = settings && settings.form_attachment_endpoint
+            ? String(settings.form_attachment_endpoint)
+            : '';
+        try {
+            var submit = new URL(String(submitUrl || ''), window.location.href);
+            var upload = configured ? new URL(configured, window.location.href) : new URL(submit.toString());
+            if (!configured) {
+                upload.pathname = upload.pathname.replace(/\/form-submit\/?$/, '/form-upload');
+                upload.search = '';
+                upload.hash = '';
+            }
+            if (
+                upload.origin !== submit.origin ||
+                !/\/functions\/v1\/form-upload\/?$/.test(upload.pathname) ||
+                upload.search || upload.hash
+            ) {
+                return '';
+            }
+            return upload.toString();
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function uploadToSignedAttachment(uploadUrl, file, sha256) {
+        var body = new FormData();
+        body.append('cacheControl', '0');
+        body.append('metadata', JSON.stringify({ sha256: sha256 }));
+        body.append('', file, file.name);
+        return fetch(uploadUrl, {
+            method: 'PUT',
+            headers: { 'x-upsert': 'false' },
+            body: body,
+            mode: 'cors',
+            credentials: 'omit'
+        }).then(function (response) {
+            if (!response.ok) {
+                throw new Error('An attachment could not be uploaded.');
+            }
+        });
+    }
+
+    function uploadQueuedAttachments(targetUrl, settings, data) {
+        var files = queuedFileEntries(data);
+        if (!files.length) { return Promise.resolve(data); }
+        if (files.length > 10) {
+            return Promise.reject(new Error('The form has too many attachments.'));
+        }
+        var totalBytes = files.reduce(function (total, item) { return total + item.file.size; }, 0);
+        if (files.some(function (item) { return item.file.size > 25 * 1024 * 1024; }) || totalBytes > 50 * 1024 * 1024) {
+            return Promise.reject(new Error('The selected attachments are too large.'));
+        }
+
+        var uploadEndpoint = resolveAttachmentEndpoint(settings, targetUrl);
+        if (!uploadEndpoint) {
+            return Promise.reject(new Error('Attachment delivery is not configured.'));
+        }
+
+        return Promise.all(files.map(function (item) {
+            return sha256File(item.file).then(function (sha256) {
+                return {
+                    position: item.position,
+                    fieldName: item.fieldName,
+                    file: item.file,
+                    sha256: sha256
+                };
+            });
+        })).then(function (preparedFiles) {
+            var headers = buildWebhookHeaders(settings && settings.form_custom_headers);
+            headers.set('Content-Type', 'application/json');
+            return fetch(uploadEndpoint, {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({
+                    submission_id: String(data.get('_ssp_submission_id') || ''),
+                    site_id: String(data.get('_ssp_site_id') || ''),
+                    form_connection_id: String(data.get('_ssp_connection_id') || ''),
+                    turnstile_token: String(data.get('cf-turnstile-response') || ''),
+                    recaptcha_token: String(data.get('g-recaptcha-response') || ''),
+                    files: preparedFiles.map(function (item) {
+                        return {
+                            field_name: item.fieldName,
+                            file_name: item.file.name,
+                            content_type: item.file.type || 'application/octet-stream',
+                            byte_size: item.file.size,
+                            sha256: item.sha256
+                        };
+                    })
+                }),
+                redirect: 'manual',
+                mode: 'cors',
+                credentials: 'omit'
+            }).then(function (response) {
+                return response.json().catch(function () { return {}; }).then(function (body) {
+                    if (!response.ok || body.success !== true || !Array.isArray(body.uploads)) {
+                        throw new Error(body.error || 'Attachment delivery could not be prepared.');
+                    }
+                    return { body: body, preparedFiles: preparedFiles };
+                });
+            });
+        }).then(function (result) {
+            if (result.body.uploads.length !== result.preparedFiles.length) {
+                throw new Error('Attachment delivery returned an invalid manifest.');
+            }
+            var attachmentIds = [];
+            return Promise.all(result.body.uploads.map(function (upload, index) {
+                var prepared = result.preparedFiles[index];
+                var attachmentId = String(upload.attachment_id || '').toLowerCase();
+                if (
+                    Number(upload.position) !== prepared.position ||
+                    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(attachmentId)
+                ) {
+                    throw new Error('Attachment delivery returned an invalid manifest.');
+                }
+                attachmentIds[index] = attachmentId;
+                if (upload.committed === true && !upload.upload_url) { return Promise.resolve(); }
+                if (!upload.upload_url) {
+                    throw new Error('Attachment delivery did not return an upload target.');
+                }
+                return uploadToSignedAttachment(String(upload.upload_url), prepared.file, prepared.sha256);
+            })).then(function () {
+                return queueSubmissionData(data, attachmentIds);
+            });
+        });
+    }
+
     function submitForm(url, settings, data, formEl) {
         if (!url) {
             handleMessage(settings, true, formEl);
@@ -1106,6 +1266,14 @@ if (!window.__sspTurnstileReady) {
 				}
 
                 if (queueTransport) {
+                    var submitQueuedData = function () {
+                        return uploadQueuedAttachments(targetUrl, settings, data).then(function (submissionData) {
+                            return submitForm(targetUrl, settings, submissionData, form);
+                        }).catch(function (error) {
+                            handleMessage(settings, true, form);
+                            return { success: false, settings: settings, form: form, error: error };
+                        });
+                    };
                     if (hasTurnstile) {
                         if (!data.has('cf-turnstile-response')) {
                             var queueTsContainer = form.querySelector('.ssp-cf-turnstile') || (form.closest('.nf-form-cont') && form.closest('.nf-form-cont').querySelector('.ssp-cf-turnstile'));
@@ -1113,7 +1281,7 @@ if (!window.__sspTurnstileReady) {
                             if (!queueTsInput && queueTsContainer) { queueTsInput = queueTsContainer.querySelector('input[name="cf-turnstile-response"]'); }
                             if (queueTsInput && queueTsInput.value) { data.set('cf-turnstile-response', queueTsInput.value); }
                         }
-                        return submitForm(targetUrl, settings, data, form);
+                        return submitQueuedData();
                     }
 
                     if (hasRecaptcha && typeof grecaptcha !== 'undefined') {
@@ -1121,7 +1289,7 @@ if (!window.__sspTurnstileReady) {
                             grecaptcha.ready(function () {
                                 grecaptcha.execute(recaptchaInput.getAttribute('data-sitekey'), { action: 'submit' }).then(function (token) {
                                     data.set('g-recaptcha-response', token);
-                                    resolve(submitForm(targetUrl, settings, data, form));
+                                    resolve(submitQueuedData());
                                 }).catch(function () {
                                     handleMessage(settings, true, form);
                                     resolve({ success: false, settings: settings, form: form, error: 'recaptcha_failed' });
@@ -1130,7 +1298,7 @@ if (!window.__sspTurnstileReady) {
                         });
                     }
 
-                    return submitForm(targetUrl, settings, data, form);
+                    return submitQueuedData();
                 }
 
                 if (hasTurnstile && restBase && targetUrl) {
